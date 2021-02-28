@@ -1,6 +1,6 @@
-CFILES = distance.c
+CFILES = seven_seg.c
 
-obj-m := distance.o
+obj-m := seven_seg.o
 gpioModule-objs := $(CFILES:.c=.o)
 ccflags-y += -std=gnu99 -Wall -Wno-declaration-after-statement
 
