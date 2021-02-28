@@ -1,0 +1,12 @@
+*.cmd
+*.o
+*.mod.c
+*.mod.o
+*.symvers
+*.mod
+*.order
+*.ko
+*.dtbo
+tags
+dtc
+make_crowpi
