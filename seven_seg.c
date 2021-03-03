@@ -17,6 +17,9 @@
 
 // SevenSegドライバーの固有情報
 struct sevenseg_device_info {
+    struct cdev cdev;
+    struct class *class;
+    int major;
     struct i2c_client *client ;
     u8 brightness; // 1-16 大きいほど明るい
     u8 blink_mode; // 0-3  0:常時点灯 1-3:大きいほど早い(0.5Hz,1Hz,2Hz)
@@ -28,13 +31,17 @@ struct sevenseg_device_info {
 static const unsigned int MINOR_BASE = 0; // udev minor番号の始まり
 static const unsigned int MINOR_NUM = 1;  // udev minorの個数
 
+/******************************************************************
+ * HT16K33チップの制御関係
+ *****************************************************************/
+
 // HT16K33 OSC ON・OFF
 s32 ht16_osc_ctl(struct sevenseg_device_info *dev_info, bool osc) {
     u8 send_data;
 
     // OSC ON・OFFコマンド　ON:0x21 OFF:0x20
     send_data = 0x20 | (int)osc;
-    pr_devel("%s: send_data=[%02X]\n", __func__, send_data); 
+    pr_devel("%s(%s): send_data=[%02X]\n", THIS_MODULE->name, __func__, send_data); 
     return i2c_smbus_write_byte(dev_info->client, send_data);
 }
 
@@ -66,7 +73,7 @@ s32 ht16_led_ctl(struct sevenseg_device_info *dev_info, bool led, u8 blink) {
     send_data = 0x80 | (int)led | blink_cmd;
     dev_info->led_on = led;
     dev_info->blink_mode = blink;
-    pr_devel("%s: send_data=[%02X]\n", __func__, send_data); 
+    pr_devel("%s(%s): send_data=[%02X]\n", THIS_MODULE->name, __func__, send_data); 
     return i2c_smbus_write_byte(dev_info->client, send_data);
 }
 
@@ -97,7 +104,7 @@ u32 sevenseg_chip_initialize(struct sevenseg_device_info *dev_info) {
     result = ht16_dimmer_ctl(dev_info, 10);
     if (result < 0) return result;
     result = i2c_smbus_write_i2c_block_data(dev_info->client, 0x00, 7, buf);
-    if (result != 0) pr_alert("%s: HT16K33 initialize fail[%d]\n", __func__, result);
+    if (result != 0) pr_alert("%s(%s): HT16K33 initialize fail[%d]\n", THIS_MODULE->name, __func__, result);
     return result;
 }
 
@@ -109,9 +116,96 @@ u32 sevenseg_chip_off(struct sevenseg_device_info *dev_info) {
     if (result < 0) return result;
     return ht16_osc_ctl(dev_info, false);
 }
+/********************************************************************
+ * udev関係　及び、ファイルアクセス関数
+ *******************************************************************/
+// ファイルアクセス関数
+static int sevenseg_open(struct inode *inode, struct file *file) {
+    return 0;
+}
 
-// sysFS関係
+static int sevenseg_close(struct inode *inode, struct file *file) {
+    return 0;
+}
 
+static ssize_t sevenseg_read(struct file *file, char __user *buf, size_t count, loff_t *offset) {
+    return count;
+}
+
+static ssize_t sevenseg_write(struct file *file, const char __user *buf, size_t count, loff_t *offset) {
+    return count;
+}
+
+static loff_t sevenseg_lseek(struct file *file, loff_t offset, int whence) {
+    return 0;
+}
+
+/* ハンドラ　テーブル */
+struct file_operations distance_fops = {
+    .owner    = THIS_MODULE,
+    .open     = sevenseg_open,
+    .release  = sevenseg_close,
+    .read     = sevenseg_read,
+    .write    = sevenseg_write,
+    .llseek   = sevenseg_lseek,
+};
+
+// キャラクタデバイスの登録と、/dev/sevensegの生成
+static int make_udev(struct sevenseg_device_info *dev_info, const char* name) { 
+    int result = 0;
+    dev_t dev;
+
+    /* メジャー番号取得 */
+    result = alloc_chrdev_region(&dev, MINOR_BASE, MINOR_NUM, name);
+    if (result != 0) {
+        pr_alert("%s(%s): Fail alloc_chrdev_region(%d)\n", THIS_MODULE->name, __func__, result);
+        goto err;
+    }
+    dev_info->major = MAJOR(dev);
+
+    /* カーネルへのキャラクタデバイスドライバ登録 */
+    cdev_init(&dev_info->cdev, &distance_fops);
+    dev_info->cdev.owner = THIS_MODULE;
+    result = cdev_add(&dev_info->cdev, dev, MINOR_NUM);
+    if (result != 0) {
+        pr_alert("%s(%s): Fail to regist cdev.(%d)\n", THIS_MODULE->name, __func__, result);
+        goto err_cdev_add;
+    }
+
+    /* カーネルクラス登録 */
+    dev_info->class = class_create(THIS_MODULE, name);
+    if (IS_ERR(dev_info->class)) {
+        result =  -PTR_ERR(dev_info->class);
+        pr_alert("%s(%s): Fail regist kernel class.(%d)\n", THIS_MODULE->name, __func__, result);
+        goto err_class_create;
+    }
+
+    /* /dev/sevenseg の生成 */
+    device_create(dev_info->class, NULL, MKDEV(dev_info->major, 0), NULL, name);
+
+    return 0;
+
+err_class_create:
+    cdev_del(&dev_info->cdev);
+err_cdev_add:
+    unregister_chrdev_region(dev, MINOR_NUM);
+err:
+    return result;
+}
+
+// キャラクタデバイス及び/dev/sevensegの登録解除
+static void remove_udev(struct sevenseg_device_info *dev_info) {
+    dev_t dev = MKDEV(dev_info->major, MINOR_BASE);
+    device_destroy(dev_info->class, MKDEV(dev_info->major, 0));
+    class_destroy(dev_info->class); /* クラス登録解除 */
+    cdev_del(&dev_info->cdev); /* デバイス除去 */
+    unregister_chrdev_region(dev, MINOR_NUM); /* メジャー番号除去 */
+}
+
+
+/********************************************************************
+* sysFS関係
+*********************************************************************/
 // sysFS LEDのブリンク制御へのアクセス関数
 static ssize_t read_sysfs_blink(struct device *dev, struct device_attribute *sttr, char *buf) {
     struct sevenseg_device_info *dev_info = dev_get_drvdata(dev);
@@ -214,17 +308,17 @@ static int make_sysfs(struct sevenseg_device_info *dev_info) {
 
     result = device_create_file(&dev_info->client->dev, &attr_brightness);
     if (result != 0) {
-        pr_err("sevenseg(%s): fail to create sysfs for brightness.[%d]\n", __func__, result);
+        pr_err("%s(%s): fail to create sysfs for brightness.[%d]\n", THIS_MODULE->name, __func__, result);
         goto err;
     }
     result = device_create_file(&dev_info->client->dev, &attr_ledon);
     if (result != 0) {
-        pr_err("sevenseg(%s): fail to create sysfs for ledon.[%d]\n", __func__, result);
+        pr_err("%s(%s): fail to create sysfs for ledon.[%d]\n", THIS_MODULE->name, __func__, result);
         goto err_ledon;
     }
     result = device_create_file(&dev_info->client->dev, &attr_blink);
     if (result != 0) {
-        pr_err("sevenseg(%s): fail to create sysfs for blink.[%d]\n", __func__, result);
+        pr_err("%s(%s): fail to create sysfs for blink.[%d]\n", THIS_MODULE->name, __func__, result);
         goto err_blink;
     }
 
@@ -244,14 +338,17 @@ static void remove_sysfs(struct sevenseg_device_info *dev_info) {
     device_remove_file(&dev_info->client->dev, &attr_blink);
 }
 
-// ドライバーの登録　及び　削除
+/***********************************************************
+ * ドライバーの初期化　及び　削除　他
+ **********************************************************/
+// ドライバーの初期化
 static int sevenseg_probe(struct i2c_client *client) {
     u32 result;
     struct sevenseg_device_info *dev_info;
 
     dev_info = (struct sevenseg_device_info*)devm_kzalloc(&client->dev, sizeof(struct sevenseg_device_info), GFP_KERNEL);
     if (!dev_info) {
-        pr_alert("%s: Fail allocate memory for device_info\n", __func__);
+        pr_alert("%s(%s): Fail allocate memory for device_info\n", THIS_MODULE->name, __func__);
         result = -ENOMEM;
         goto err;
     }
@@ -266,26 +363,34 @@ static int sevenseg_probe(struct i2c_client *client) {
     result = make_sysfs(dev_info);
     if (result != 0) goto err;
         
+    // udevの生成
+    result = make_udev(dev_info, THIS_MODULE->name);
+    if (result != 0) goto err_udev;
     
-    pr_info("%s: Seven Segment LED driver installed. i2c_addr=[0x%02X]\n", __func__, client->addr);
+    pr_info("%s(%s): Seven Segment LED driver installed. i2c_addr=[0x%02X]\n",
+            THIS_MODULE->name, __func__, client->addr);
     return result;
 
+err_udev:
+    remove_sysfs(dev_info);
 err:
     return result;
 }
 
+// ドライバの後始末
 static int sevenseg_remove(struct i2c_client *client) {
     struct sevenseg_device_info *dev_info = (struct sevenseg_device_info *)i2c_get_clientdata(client);
 
+    remove_udev(dev_info);
     remove_sysfs(dev_info);
     sevenseg_chip_off(dev_info);
-
     
-    pr_info("%s: Seven Segment LED driver removed.", __func__);
+    pr_info("%s(%s): Seven Segment LED driver removed.", THIS_MODULE->name, __func__);
     return 0;
 
 }
 
+// ドライバのシステムへの登録に関わる諸々
 static struct i2c_device_id i2c_seven_seg_ids[] = {
     {"SevenSegLED", 0},
     {},
