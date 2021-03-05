@@ -7,6 +7,7 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/types.h>
+#include <linux/minmax.h>
 #include <linux/fs.h>
 #include <linux/cdev.h>
 #include <linux/of.h>
@@ -17,13 +18,17 @@
 
 // SevenSegドライバーの固有情報
 struct sevenseg_device_info {
+    u8 brightness; // 1-16 大きいほど明るい
+    u8 blink_mode; // 0-3  0:常時点灯 1-3:大きいほど早い(0.5Hz,1Hz,2Hz)
+    bool led_on;
+    bool is_char_mode;
+    u8 led_vram[16]; // LED表示パターン。実使用は、0,2,4,6のみ。
+    u8 cur_pos;    // 0-3 左端よりの桁数
+    // kernel内のオブジェクト達
     struct cdev cdev;
     struct class *class;
     int major;
     struct i2c_client *client ;
-    u8 brightness; // 1-16 大きいほど明るい
-    u8 blink_mode; // 0-3  0:常時点灯 1-3:大きいほど早い(0.5Hz,1Hz,2Hz)
-    bool led_on;
 };
     
 
@@ -91,20 +96,40 @@ s32 ht16_dimmer_ctl(struct sevenseg_device_info *dev_info, u8 brightness) {
     return i2c_smbus_write_byte(dev_info->client, send_data);
 }
     
+//  HT16K33 VRAMの書き込み。vram_buffの内容を出力。
+//  引数: init  これをtrueにすると、16バイト書き込む。false時は、先頭7バイトのみ。
+u32 ht16_buffer_write(struct sevenseg_device_info *dev_info, bool init) {
+    u32 result;
+    int write_count = init ? 16 : 7;
+    result = i2c_smbus_write_i2c_block_data(dev_info->client, 
+            0x00, write_count, dev_info->led_vram);
+    return result;
+}
+    
 // 7SEG LED ドライバーチップ　HT16K33 初期化
 u32 sevenseg_chip_initialize(struct sevenseg_device_info *dev_info) {
     // OSC:0n LED:On 点滅:無し　明るさ:10 表示:空白
     u32 result;
-    u8 buf[7]={0x01, 0x00, 0x02, 0x00, 0x04, 0x00, 0x08};
-
+    int i;
+    
     result = ht16_osc_ctl(dev_info, true);
-    if (result < 0) return result;
+    if (result < 0) goto error;
     result = ht16_led_ctl(dev_info, true, 0);
-    if (result < 0) return result;
+    if (result < 0) goto error;
     result = ht16_dimmer_ctl(dev_info, 10);
-    if (result < 0) return result;
-    result = i2c_smbus_write_i2c_block_data(dev_info->client, 0x00, 7, buf);
-    if (result != 0) pr_alert("%s(%s): HT16K33 initialize fail[%d]\n", THIS_MODULE->name, __func__, result);
+    if (result < 0) goto error;
+
+    for (i = 0; i < 16; i++) {
+        dev_info->led_vram[i] = 0x00;
+    }
+    result = ht16_buffer_write(dev_info, true);
+    if (result < 0) goto error;
+    dev_info->cur_pos = 0;
+    dev_info->is_char_mode = false;
+    return 0;
+
+error:
+    pr_alert("%s(%s): HT16K33 initialize fail[%d]\n", THIS_MODULE->name, __func__, result);
     return result;
 }
 
@@ -121,6 +146,9 @@ u32 sevenseg_chip_off(struct sevenseg_device_info *dev_info) {
  *******************************************************************/
 // ファイルアクセス関数
 static int sevenseg_open(struct inode *inode, struct file *file) {
+    struct sevenseg_device_info *d_dev = 
+        container_of(inode->i_cdev, struct sevenseg_device_info, cdev);
+    file->private_data = d_dev;
     return 0;
 }
 
@@ -133,7 +161,29 @@ static ssize_t sevenseg_read(struct file *file, char __user *buf, size_t count, 
 }
 
 static ssize_t sevenseg_write(struct file *file, const char __user *buf, size_t count, loff_t *offset) {
-    return count;
+    struct sevenseg_device_info *dev_info = file->private_data;
+    char k_buff[16];
+    int result;
+    int cnt;
+    int i;
+
+    if (count==0) return 0;
+    if (copy_from_user(k_buff, buf, min(count,(size_t)16)) != 0) return -EFAULT;
+    
+    if (dev_info->is_char_mode) {
+        // キャラクターモードの処理。今は未実装
+        result = count;
+    } else {
+        cnt = (count > 4) ? 4 : count;
+        for (i = 0; i < cnt; i++) {
+            dev_info->led_vram[dev_info->cur_pos*2] = k_buff[i];
+            dev_info->cur_pos = (dev_info->cur_pos + 1) % 4;
+        }
+        result = ht16_buffer_write(dev_info, false);
+        if (result == 0) result = count;
+    }
+
+    return result;
 }
 
 static loff_t sevenseg_lseek(struct file *file, loff_t offset, int whence) {
@@ -206,6 +256,37 @@ static void remove_udev(struct sevenseg_device_info *dev_info) {
 /********************************************************************
 * sysFS関係
 *********************************************************************/
+// sysFS 書き込みモードの設定
+//  1: キャラクターモード
+//  0: バイナリモード
+static ssize_t read_sysfs_is_char_mode(struct device *dev, struct device_attribute *attr, char *buf) {
+    struct sevenseg_device_info *dev_info = dev_get_drvdata(dev);
+
+    return snprintf(buf, PAGE_SIZE, "%d\n", dev_info->is_char_mode);
+}
+
+static ssize_t write_sysfs_is_char_mode(struct device *dev, struct device_attribute *attr, const char *buf, size_t count) {
+    struct sevenseg_device_info *dev_info = dev_get_drvdata(dev);
+    int input_value;
+    int result;
+    
+    if (count > 3) return -EINVAL;
+    result = kstrtoint(buf, 10, &input_value);
+    if (result != 0) return -EINVAL;
+    if (input_value != 0 && input_value != 1) return -EINVAL;
+    dev_info->is_char_mode = (bool)input_value;
+    return count;
+}
+
+struct device_attribute attr_is_char_mode = {
+    .attr = {
+        .name = "is_char_mode",
+        .mode = S_IRUGO | S_IWUGO,
+    },
+    .show = read_sysfs_is_char_mode,
+    .store = write_sysfs_is_char_mode,
+};
+
 // sysFS LEDのブリンク制御へのアクセス関数
 static ssize_t read_sysfs_blink(struct device *dev, struct device_attribute *sttr, char *buf) {
     struct sevenseg_device_info *dev_info = dev_get_drvdata(dev);
@@ -235,7 +316,6 @@ struct device_attribute attr_blink = {
     .show = read_sysfs_blink,
     .store = write_sysfs_blink,
 };
-
 
 // sysFS LEDのON・OFFへのアクセス関数
 static ssize_t read_sysfs_ledon(struct device*dev, struct device_attribute *attr, char *buf) {
@@ -321,9 +401,16 @@ static int make_sysfs(struct sevenseg_device_info *dev_info) {
         pr_err("%s(%s): fail to create sysfs for blink.[%d]\n", THIS_MODULE->name, __func__, result);
         goto err_blink;
     }
+    result = device_create_file(&dev_info->client->dev, &attr_is_char_mode);
+    if (result != 0) {
+        pr_err("%s(%s): fail to create sysfs for is_char_mode.[%d]\n", THIS_MODULE->name, __func__, result);
+        goto err_is_char_mode;
+    }
 
     return 0;
     
+err_is_char_mode:
+    device_remove_file(&dev_info->client->dev, &attr_blink);
 err_blink:
     device_remove_file(&dev_info->client->dev, &attr_ledon);
 err_ledon:
@@ -336,6 +423,7 @@ static void remove_sysfs(struct sevenseg_device_info *dev_info) {
     device_remove_file(&dev_info->client->dev, &attr_brightness);
     device_remove_file(&dev_info->client->dev, &attr_ledon);
     device_remove_file(&dev_info->client->dev, &attr_blink);
+    device_remove_file(&dev_info->client->dev, &attr_is_char_mode);
 }
 
 /***********************************************************
