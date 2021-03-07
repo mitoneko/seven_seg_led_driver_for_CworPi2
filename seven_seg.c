@@ -256,6 +256,21 @@ static void remove_udev(struct sevenseg_device_info *dev_info) {
 /********************************************************************
 * sysFS関係
 *********************************************************************/
+// 入力数値の文字列を数値に変換する
+// 返り値: 正常なら0。負の値はエラー
+// 引数:
+//  buf: 入力文字列  max: 最大値   min: 最小値　value: 戻り値
+static int char_to_int(const char *buf, int *value, int max, int min) {
+    int ret_value;
+    int result;
+
+    result = kstrtoint(buf, 10, &ret_value);
+    if (result != 0) return -EINVAL;
+    if (ret_value < min || ret_value > max ) return -EINVAL;
+    *value = ret_value;
+    return 0;
+}
+
 // sysFS 書き込みモードの設定
 //  1: キャラクターモード
 //  0: バイナリモード
@@ -268,12 +283,9 @@ static ssize_t read_sysfs_is_char_mode(struct device *dev, struct device_attribu
 static ssize_t write_sysfs_is_char_mode(struct device *dev, struct device_attribute *attr, const char *buf, size_t count) {
     struct sevenseg_device_info *dev_info = dev_get_drvdata(dev);
     int input_value;
-    int result;
     
     if (count > 3) return -EINVAL;
-    result = kstrtoint(buf, 10, &input_value);
-    if (result != 0) return -EINVAL;
-    if (input_value != 0 && input_value != 1) return -EINVAL;
+    if (char_to_int(buf, &input_value, 1, 0)) return -EINVAL;  
     dev_info->is_char_mode = (bool)input_value;
     return count;
 }
@@ -299,10 +311,7 @@ static ssize_t write_sysfs_blink(struct device *dev, struct device_attribute *at
     int input_value;
     int result;
 
-    if (count > 3) return -EINVAL;
-    result = kstrtoint(buf, 10, &input_value);
-    if (result != 0) return -EINVAL;
-    if (input_value < 0 || input_value > 3) return -EINVAL;
+    if (char_to_int(buf, &input_value, 3, 0)) return -EINVAL;
     result = ht16_led_ctl(dev_info, dev_info->led_on, input_value);
     if (result != 0) return -EIO;
     return count;
@@ -329,10 +338,7 @@ static ssize_t write_sysfs_ledon(struct device *dev, struct device_attribute *at
     int input_value;
     int result;
 
-    if (count > 3) return -EINVAL;
-    result = kstrtoint(buf, 10, &input_value);
-    if (result != 0) return -EINVAL;
-    if (input_value!=0 && input_value!=1) return -EINVAL;
+    if (char_to_int(buf, &input_value, 1, 0)) return -EINVAL;
     result = ht16_led_ctl(dev_info, (bool)input_value, dev_info->blink_mode);
     if (result != 0) return -EIO;
     return count;
@@ -359,12 +365,7 @@ static ssize_t write_sysfs_brightness(struct device *dev, struct device_attribut
     int brightness;
     int result;
 
-    if (count > 3) return -EINVAL;
-    result = kstrtoint(buf, 10, &brightness);
-    if (result != 0) return -EINVAL;
-    if (brightness < 1) brightness = 1;
-    if (brightness > 16) brightness = 16;
-
+    if (char_to_int(buf, &brightness, 16, 1)) return -EINVAL;
     result = ht16_dimmer_ctl(dev_info, brightness);
     if (result != 0) return -EIO;
     dev_info->brightness = brightness;
