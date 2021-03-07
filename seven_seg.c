@@ -30,8 +30,6 @@ struct sevenseg_device_info {
     int major;
     struct i2c_client *client ;
 };
-    
-
 
 static const unsigned int MINOR_BASE = 0; // udev minor番号の始まり
 static const unsigned int MINOR_NUM = 1;  // udev minorの個数
@@ -39,9 +37,48 @@ static const unsigned int MINOR_NUM = 1;  // udev minorの個数
 /******************************************************************
  * HT16K33チップの制御関係
  *****************************************************************/
+// キャラクタジェネレータ
+// 文字を取り、LED表示コードを返す。未定義の文字は、'_'とする。
+static u8 char_generator(char c) {
+    u8 result;
+    switch (c) {
+        case '0': result=0xf3; break;
+        case '1': result=0x06; break;
+        case '2': result=0x5b; break;
+        case '3': result=0x4f; break;
+        case '4': result=0x66; break;
+        case '5': result=0x6d; break;
+        case '6': result=0x7c; break;
+        case '7': result=0x07; break;
+        case '8': result=0x7f; break;
+        case '9': result=0x6f; break;
+        default: result=0x08;
+    }
+    return result;
+}
+
+// '.'と':'のキャラクタジェネレート処理
+// 処理をした場合は、trueを返す。
+static bool period_generator(struct sevenseg_device_info *dev_info, char c) {
+    int prev_pos;
+    bool result = false;
+    if (c == '.') {
+        prev_pos = (dev_info->cur_pos-1 < 0) ? 3 : dev_info->cur_pos - 1;
+        switch (prev_pos) {
+            case 0: break;
+            case 1: dev_info->led_vram[0*2] |= 0x80; break;
+            default: dev_info->led_vram[prev_pos*2] |= 0x80; 
+        }
+        result = true;
+    } else if (c == ':') { // ':'が来れば、無条件で2桁目の最上位ビット
+        dev_info->led_vram[1*2] |= 0x80;
+        result = true;
+    }
+    return result;
+}
 
 // HT16K33 OSC ON・OFF
-s32 ht16_osc_ctl(struct sevenseg_device_info *dev_info, bool osc) {
+static s32 ht16_osc_ctl(struct sevenseg_device_info *dev_info, bool osc) {
     u8 send_data;
 
     // OSC ON・OFFコマンド　ON:0x21 OFF:0x20
@@ -54,7 +91,7 @@ s32 ht16_osc_ctl(struct sevenseg_device_info *dev_info, bool osc) {
 // 引数:
 //  led: 真でon
 //  blink: 0-3 0->常時点灯　1-3->大きいほど早い(0.5hz, 1hz, 2hz)
-s32 ht16_led_ctl(struct sevenseg_device_info *dev_info, bool led, u8 blink) {
+static s32 ht16_led_ctl(struct sevenseg_device_info *dev_info, bool led, u8 blink) {
     u8 send_data;
     u8 blink_cmd;
 
@@ -84,7 +121,7 @@ s32 ht16_led_ctl(struct sevenseg_device_info *dev_info, bool led, u8 blink) {
 
 // HT16K33 明るさの設定
 // 　引数:brightness 1-16 数字が大きいほど明るい
-s32 ht16_dimmer_ctl(struct sevenseg_device_info *dev_info, u8 brightness) {
+static s32 ht16_dimmer_ctl(struct sevenseg_device_info *dev_info, u8 brightness) {
     u8 send_data;
 
     // Dimmerコントロール
@@ -98,7 +135,7 @@ s32 ht16_dimmer_ctl(struct sevenseg_device_info *dev_info, u8 brightness) {
     
 //  HT16K33 VRAMの書き込み。vram_buffの内容を出力。
 //  引数: init  これをtrueにすると、16バイト書き込む。false時は、先頭7バイトのみ。
-u32 ht16_buffer_write(struct sevenseg_device_info *dev_info, bool init) {
+static u32 ht16_buffer_write(struct sevenseg_device_info *dev_info, bool init) {
     u32 result;
     int write_count = init ? 16 : 7;
     result = i2c_smbus_write_i2c_block_data(dev_info->client, 
@@ -107,7 +144,7 @@ u32 ht16_buffer_write(struct sevenseg_device_info *dev_info, bool init) {
 }
     
 // 7SEG LED ドライバーチップ　HT16K33 初期化
-u32 sevenseg_chip_initialize(struct sevenseg_device_info *dev_info) {
+static u32 sevenseg_chip_initialize(struct sevenseg_device_info *dev_info) {
     // OSC:0n LED:On 点滅:無し　明るさ:10 表示:空白
     u32 result;
     int i;
@@ -125,7 +162,7 @@ u32 sevenseg_chip_initialize(struct sevenseg_device_info *dev_info) {
     result = ht16_buffer_write(dev_info, true);
     if (result < 0) goto error;
     dev_info->cur_pos = 0;
-    dev_info->is_char_mode = false;
+    dev_info->is_char_mode = true;
     return 0;
 
 error:
@@ -134,7 +171,7 @@ error:
 }
 
 // 7SEG LED ドライバーチップ　HT16K33 オフ(表示・OSCをともにカット)
-u32 sevenseg_chip_off(struct sevenseg_device_info *dev_info) {
+static u32 sevenseg_chip_off(struct sevenseg_device_info *dev_info) {
     u32 result;
 
     result = ht16_led_ctl(dev_info, false, 0);
@@ -170,10 +207,20 @@ static ssize_t sevenseg_write(struct file *file, const char __user *buf, size_t 
     if (count==0) return 0;
     if (copy_from_user(k_buff, buf, min(count,(size_t)16)) != 0) return -EFAULT;
     
-    if (dev_info->is_char_mode) {
-        // キャラクターモードの処理。今は未実装
-        result = count;
-    } else {
+    if (dev_info->is_char_mode) { // キャラクターモード時
+        cnt = 0; // '.',':'以外の文字をカウントする。
+        for (i = 0; i < count; i++) {
+            if (k_buff[i] == '\0') {
+                break;
+            } else if (period_generator(dev_info, k_buff[i])) {
+                continue;
+            } else {
+                dev_info->led_vram[dev_info->cur_pos*2] = char_generator(k_buff[i]);
+                dev_info->cur_pos = (dev_info->cur_pos + 1) % 4;
+            }
+            if (++cnt > 4) break;
+        }
+    } else { // バイナリモード時
         cnt = (count > 4) ? 4 : count;
         for (i = 0; i < cnt; i++) {
             dev_info->led_vram[dev_info->cur_pos*2] = k_buff[i];
@@ -182,6 +229,9 @@ static ssize_t sevenseg_write(struct file *file, const char __user *buf, size_t 
         result = ht16_buffer_write(dev_info, false);
         if (result == 0) result = count;
     }
+
+    result = ht16_buffer_write(dev_info, false);
+    if (result == 0) result = count;
 
     return result;
 }
